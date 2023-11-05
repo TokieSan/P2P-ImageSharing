@@ -47,7 +47,6 @@ fn send_image_to_server(server_address: &str, image_path: &str) -> Result<()> {
     // Send the image data to the server at the specified address.
     socket.send_to(&image_data, server_address)?;
 
-    println!("Image sent to the server.");
     Ok(())
 }
 
@@ -73,6 +72,8 @@ fn main() -> io::Result<()> {
                 for server_address in server_addresses {
                     if let Err(err) = send_image_to_server(server_address, image_path) {
                         eprintln!("Error sending image to the server: {}", err);
+                    } else {
+                        println!("Image sent to the server.");
                     }
                 }
             }

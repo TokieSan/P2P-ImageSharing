@@ -97,30 +97,25 @@ fn main() -> io::Result<()> {
 
 
     let next_server_address: String = server_addresses[next_server].parse().expect("Invalid server address");
-
+    
+    let leader_addr = "0.0.0.0:8888";
     let handle = thread::spawn(move || {
         println!("Listening for clients...");
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((amt, src)) => {
                     println!("Received {} bytes from: {}", amt, src);
-                    if let Err(err) = write_image_to_file(&buf[..amt], &src) {
-                        eprintln!("Error writing image to file: {}", err);
-                    }
 
-                    // Check if this server is responsible for saving the image.
-                    let current_time = Utc::now().format("%Y-%m-%d %H-%M-%S").to_string();
-                    let coordination_file_path = format!("{}/coordination.txt", shared_directory);
+                    // Relay to next server so we can find who is the leader
+                    //if let Err(err) = socket.send_to(&buf[..amt], &next_server_address) {
+                        //eprintln!("Error relaying image data to the next server: {}", err);
+                    //}                
+                    // Recieve Responses from previous server
 
-                    if !File::open(&coordination_file_path).is_ok() {
-                        // Save the image only if the coordination file doesn't exist.
-                        if let Err(err) = File::create(&coordination_file_path) {
-                            eprintln!("Error creating coordination file: {}", err);
-                        }
-
-                        // Relay the image data to the next server in the ring.
-                        if let Err(err) = socket.send_to(&buf[..amt], &next_server_address) {
-                            eprintln!("Error relaying image data to the next server: {}", err);
+                    // Am I the leader? If so write to file, if not do nothing.
+                    if server_address == leader_addr {
+                        if let Err(err) = write_image_to_file(&buf[..amt], &src) {
+                            eprintln!("Error writing image data to file: {}", err);
                         }
                     }
                 }
