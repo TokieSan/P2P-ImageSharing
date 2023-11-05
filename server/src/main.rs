@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::fs::{File, create_dir_all};
 use chrono::Utc;
+use serde::{Serialize, Deserialize};
+use bincode;
 
 //fn handle_client(
     //mut stream: TcpStream,
@@ -43,6 +45,25 @@ use chrono::Utc;
         //}
     //}
 //}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ServerMessage {
+    sender: i32,
+    client: String,
+    data: Vec<u8>,
+    msg_type: i32, // 0 broadcast question, 1 information
+}
+
+// Function to determine if the message is serialized or direct.
+fn is_serialized_message(data: &[u8]) -> bool {
+    deserialize_message(&data).is_ok()
+}
+
+// Function to deserialize the message.
+fn deserialize_message(data: &[u8]) -> Result<ServerMessage> {
+  bincode::deserialize(data)
+     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
 
 fn write_image_to_file(data: &[u8], client_addr: &SocketAddr) -> Result<()> {
     // Get the current UTC date and time as a string.
@@ -81,42 +102,56 @@ fn main() -> io::Result<()> {
         "0.0.0.0:8887", 
     ];
 
-    let shared_directory = "shared_directory"; // Directory for shared coordination.
+    let my_index : i32 = server_addresses.iter().position(|&s| s == server_address).unwrap() as i32;
 
-    // Create a directory for coordination (if it doesn't exist).
-    create_dir_all(shared_directory).expect("Failed to create shared directory");
+    let mut processed: HashMap<(String, usize), bool> = HashMap::new(); // first is client second
+                                                                        // is message size
 
-
-    let next_server = match server_addresses.iter().position(|&addr| addr == server_address) {
-        Some(index) => (index + 1) % server_addresses.len(),
-        None => {
-            eprintln!("Server address not found in the list.");
-            return Ok(());
-        }
-    };
-
-
-    let next_server_address: String = server_addresses[next_server].parse().expect("Invalid server address");
-    
-    let leader_addr = "0.0.0.0:8888";
     let handle = thread::spawn(move || {
         println!("Listening for clients...");
+        let mut current_leader: i32 = -1;
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((amt, src)) => {
+                    // TODO Split it to two functions, one handle if the message is serialized and
+                    // the other if it is not (server vs client message)
+
                     println!("Received {} bytes from: {}", amt, src);
 
-                    // Relay to next server so we can find who is the leader
-                    //if let Err(err) = socket.send_to(&buf[..amt], &next_server_address) {
-                        //eprintln!("Error relaying image data to the next server: {}", err);
-                    //}                
-                    // Recieve Responses from previous server
+                    let message = ServerMessage {
+                        sender: my_index,
+                        msg_type: 0,
+                        client: src.clone().to_string(),
+                        data: buf[..amt].to_vec(),
+                    };
 
-                    // Am I the leader? If so write to file, if not do nothing.
-                    if server_address == leader_addr {
-                        if let Err(err) = write_image_to_file(&buf[..amt], &src) {
-                            eprintln!("Error writing image data to file: {}", err);
+                    // Serialize the struct into a byte array.
+                    let serialized_message = bincode::serialize(&message).unwrap();
+
+                    if deserialize_message(&serialized_message).is_ok() {
+                        println!("Message is serialized.");
+                    } else {
+                        println!("Message is not serialized.");
+                    }
+
+                    // Relay to next server so we can find who is the leader
+                    if current_leader == -1 {
+                        // Broadcast to all servers to find the leader, if not I am the leader
+                    }
+
+                    if current_leader == my_index || current_leader == -1 {
+                        let cur_client = src.to_string().split(':').next().unwrap().to_owned();
+                        if !processed.contains_key(&(cur_client.clone(), amt)) {
+                            if let Err(err) = write_image_to_file(&buf[..amt], &src) {
+                                eprintln!("Error writing image data to file: {}", err);
+                            }
+                            processed.insert((cur_client, amt), true);
                         }
+                        current_leader = my_index;
+                        // let all of them know i am the leader
+                    } else {
+                        // is the leader alive? if so, do nothing he should have recieved the
+                        // message and processed it
                     }
                 }
                 Err(e) => {

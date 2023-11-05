@@ -72,10 +72,9 @@ fn main() -> io::Result<()> {
                 for server_address in server_addresses {
                     if let Err(err) = send_image_to_server(server_address, image_path) {
                         eprintln!("Error sending image to the server: {}", err);
-                    } else {
-                        println!("Image sent to the server.");
                     }
                 }
+                println!("Image sent to the server.");
             }
             "list" => {
                 //stream.write(b"list")?;
