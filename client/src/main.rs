@@ -73,6 +73,7 @@ fn main() -> io::Result<()> {
                     if let Err(err) = send_image_to_server(server_address, image_path) {
                         eprintln!("Error sending image to the server: {}", err);
                     }
+                    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0));
                 }
                 println!("Image sent to the server.");
             }
