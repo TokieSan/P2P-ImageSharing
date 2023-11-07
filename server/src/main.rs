@@ -1,6 +1,6 @@
 use std::io;
 use std::cmp::max;
-use std::time;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 //use std::net::{TcpListener, TcpStream};
 use std::net::{UdpSocket, SocketAddr};
@@ -165,14 +165,14 @@ fn main() -> io::Result<()> {
                             let serialized_response = bincode::serialize(&response).unwrap();
                             socket_server.send_to(&serialized_response, decrement_port(server_addresses[message.sender as usize])).expect("Failed to send response");
                         } else if response.msg_type == 3 {
-                            if message.cur_leader == my_index {
-                                response.sender = my_index;
-                                response.msg_type = 3;
-                                let serialized_response = bincode::serialize(&response).unwrap();
-                                socket_server.send_to(&serialized_response, decrement_port(server_addresses[message.sender as usize])).expect("Failed to send response");
-                            } else {
-                                leader_alive1.store(true, Ordering::SeqCst);
-                            }
+                            //if message.cur_leader == my_index {
+                                //response.sender = my_index;
+                                //response.msg_type = 3;
+                                //let serialized_response = bincode::serialize(&response).unwrap();
+                                //socket_server.send_to(&serialized_response, decrement_port(server_addresses[message.sender as usize])).expect("Failed to send response");
+                            //} else {
+                                //leader_alive1.store(true, Ordering::SeqCst);
+                            //}
                         } else if response.msg_type == 2 {
                             // information
                             current_leader = max(current_leader, message.cur_leader);
@@ -224,7 +224,7 @@ fn main() -> io::Result<()> {
                             }
                         }
 
-                        std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0 + 3.0));
+                        std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 6.0 + 3.0));
 
                         if current_leader == my_index || current_leader == -1 {
                             let cur_client = src.to_string().split(':').next().unwrap().to_owned();
@@ -248,28 +248,91 @@ fn main() -> io::Result<()> {
                             // is the leader alive? if so, do nothing he should have recieved the
                             // message and processed it
                             message.msg_type = 3;
-                            socket.send_to(&serialized_message, decrement_port(server_addresses[current_leader as usize].clone())).expect("Failed to send message");
-                            std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0 + 6.0));
+                            socket.send_to(&serialized_message, server_addresses[current_leader as usize].clone()).expect("Failed to send message");
 
-                            if !leader_alive2.load(Ordering::SeqCst){
-                                // Leader is dead, I am the new leader
-                                println!("Leader {} is dead, I, {}, am the new leader", current_leader, my_index);
-                                current_leader = my_index;
-                                message.msg_type = 2;
-                                message.cur_leader = current_leader;
-                                let serialized_message = bincode::serialize(&message).unwrap();
-                                // I am the leader
-                                for cur_server in server_addresses {
-                                    if cur_server != &server_addresses[my_index as usize] {
-                                        socket.send_to(&serialized_message, decrement_port(cur_server.clone())).expect("Failed to send message");
+                            let mut buf_2 = [0u8; 65507];
+
+                            socket.set_read_timeout(Some(Duration::from_secs(5)))
+                                .expect("Failed to set read timeout");
+
+                            match socket.recv_from(&mut buf_2) {
+                                Ok((amt_2, src_2)) => {
+                                    let message_2 = deserialize_message(&buf_2).unwrap();
+                                    println!("Message: Sent by: {} to: {} type: {} leader: {}", message_2.sender, message_2.client, message_2.msg_type, message_2.cur_leader);
+                                    if message_2.msg_type == 3 {
+                                        println!("Leader is alive");
+                                    } else {
+                                        println!("collision happened");
+                                    }
+                                } Err(_) => {
+                                    // Leader is dead, I am the new leader
+                                    leader_alive2.store(false, Ordering::SeqCst);
+                                    let old_leader = current_leader;
+                                    let message_3 = ServerMessage {
+                                        sender: my_index,
+                                        msg_type: 0,
+                                        cur_leader: my_index,
+                                        client: src.clone().to_string(),
+                                        data: vec![],
+                                    };
+                                    let serialized_message_3 = bincode::serialize(&message_3).unwrap();
+                                    println!("Leader {} is dead, I will see if there is some leader set", current_leader);
+                                    for cur_server in server_addresses {
+                                        if cur_server != &server_addresses[my_index as usize] {
+                                            socket.send_to(&serialized_message_3, decrement_port(cur_server.clone())).expect("Failed to send message");
+                                        }
+                                    }
+
+                                    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 6.0 + 3.0));
+
+                                    if current_leader == old_leader {
+                                        // No leader, I am the leader
+                                        current_leader = my_index;
+                                        message.msg_type = 2;
+                                        message.cur_leader = current_leader;
+                                        let serialized_message = bincode::serialize(&message).unwrap();
+                                        for cur_server in server_addresses {
+                                            if cur_server != &server_addresses[my_index as usize] {
+                                                socket.send_to(&serialized_message, decrement_port(cur_server.clone())).expect("Failed to send message");
+                                            }
+                                        }
+
+                                        std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0));
+                                        let cur_client = src.to_string().split(':').next().unwrap().to_owned();
+                                        if !processed.contains_key(&(cur_client.clone(), amt)) {
+                                            if let Err(err) = write_image_to_file(&buf[..amt]) {
+                                                eprintln!("Error writing image data to file: {}", err);
+                                            }
+                                            processed.insert((cur_client, amt), true);
+                                        } else {
+                                            println!("Already processed this image");
+                                        }
+
                                     }
                                 }
-                                std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0));
                             }
+                            socket.set_read_timeout(None).expect("set_read_timeout call failed");
 
                         }
+                    } else {
+                        // Recieved a message from a server.
+                        let message: ServerMessage = bincode::deserialize(&buf[..amt]).unwrap();
+                        println!("Message: Sent by: {} to: {} type: {} leader: {}", message.sender, message.client, message.msg_type, message.cur_leader);
+
+                        let mut response = ServerMessage {
+                            sender: my_index,
+                            client: message.client.clone(),
+                            cur_leader : current_leader,
+                            data: vec![],
+                            msg_type: 3,
+                        };
+
+                        // message type is 3
+                        current_leader = my_index;
+                        let serialized_response = bincode::serialize(&response).unwrap();
+                        socket.send_to(&serialized_response, server_addresses[message.sender as usize]).expect("Failed to send response");
+                        leader_alive2.store(true, Ordering::SeqCst);
                     }
-                    leader_alive2.store(false, Ordering::SeqCst);
                 }
                 Err(e) => {
                     eprintln!("Error receiving data: {}", e);
