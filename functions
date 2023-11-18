@@ -1,0 +1,302 @@
+use std::io;
+use std::cmp::max;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{UdpSocket, SocketAddr};
+use std::io::{Read, Write, Result};
+use std::thread;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::fs::{File, create_dir_all};
+use chrono::Utc;
+use serde::{Serialize, Deserialize};
+use bincode;
+
+const MAX_BUFFER_SIZE: usize = 65507;
+const SERVER_ADDRESSES: [&str; 3] = ["0.0.0.0:8887", "0.0.0.0:8888", "0.0.0.0:8889"];
+const INITIAL_LEADER: i32 = 0;
+const IMAGE_PROCESSING_DELAY_SECS: f32 = 6.0;
+const LEADER_ALIVE_CHECK_DELAY_SECS: u64 = 5;
+const IMAGE_PROCESSING_RETRY_DELAY_SECS: f32 = 3.0;
+
+#[derive(Serialize, Deserialize, Debug)]
+enum MessageType {
+    BroadcastQuestion,
+    Information,
+    IAmLeader,
+    AreLeaderAlive,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ServerMessage {
+    sender: i32,
+    client: String,
+    data: Vec<u8>,
+    cur_leader: i32,
+    msg_type: MessageType,
+}
+
+fn is_serialized_message(data: &[u8]) -> bool {
+    deserialize_message(&data).is_ok()
+}
+
+fn deserialize_message(data: &[u8]) -> Result<ServerMessage> {
+    bincode::deserialize(data).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn write_image_to_file(data: &[u8]) -> Result<()> {
+    let current_datetime = Utc::now().to_rfc3339();
+    let filename = format!("received_{}.jpg", current_datetime);
+    let filename_clone = filename.clone();
+    let mut file = File::create(filename)?;
+    file.write_all(data)?;
+
+    println!("Image saved as: {}", filename_clone);
+    Ok(())
+}
+
+fn decrement_port(addr: &str) -> String {
+    let mut parts = addr.split(':');
+    let ip = parts.next().unwrap();
+    let mut port = parts.next().unwrap().chars().collect::<Vec<char>>();
+    port[0] = (port[0].to_digit(10).unwrap() - 1).to_string().chars().next().unwrap();
+    format!("{}:{}", ip, port.iter().collect::<String>())
+}
+
+fn handle_broadcast_question(
+    socket_server: &UdpSocket,
+    sender: i32,
+    server_addresses: &[&str],
+) -> Result<()> {
+    let response = ServerMessage {
+        sender,
+        client: String::new(),
+        cur_leader: 0,
+        data: vec![],
+        msg_type: MessageType::Information,
+    };
+
+    let serialized_response = bincode::serialize(&response)?;
+    for cur_server in server_addresses {
+        if cur_server != &server_addresses[sender as usize] {
+            socket_server.send_to(&serialized_response, decrement_port(cur_server.clone()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_information(
+    current_leader_mutex: &mut MutexGuard<i32>,
+    message: &ServerMessage,
+) {
+    *current_leader_mutex = max(*current_leader_mutex, message.cur_leader);
+    println!(
+        "Information received from: {} that {} is the leader",
+        message.sender, *current_leader_mutex
+    );
+}
+
+fn handle_leader_alive_check(
+    socket: &UdpSocket,
+    current_leader_mutex: &MutexGuard<i32>,
+    server_addresses: &[&str],
+) -> Result<()> {
+    let response = ServerMessage {
+        sender: 0,
+        client: String::new(),
+        cur_leader: *current_leader_mutex,
+        data: vec![],
+        msg_type: MessageType::AreLeaderAlive,
+    };
+
+    let serialized_response = bincode::serialize(&response)?;
+    socket.set_read_timeout(Some(Duration::from_secs(LEADER_ALIVE_CHECK_DELAY_SECS)))?;
+
+    for cur_server in server_addresses {
+        socket.send_to(&serialized_response, decrement_port(cur_server.clone()))?;
+
+        let mut buf = [0u8; MAX_BUFFER_SIZE];
+        match socket.recv_from(&mut buf) {
+            Ok((amt, _)) => {
+                let message = deserialize_message(&buf[..amt])?;
+                println!(
+                    "Message: Sent by: {} to: {} type: {} leader: {}",
+                    message.sender, message.client, message.msg_type as i32, message.cur_leader
+                );
+
+                if message.msg_type == MessageType::AreLeaderAlive {
+                    println!("Leader is alive");
+                } else {
+                    println!("Collision happened");
+                }
+            }
+            Err(_) => {
+                leader_alive.store(false, Ordering::SeqCst);
+                let old_leader = *current_leader_mutex;
+                let message_3 = ServerMessage {
+                    sender: 0,
+                    client: String::new(),
+                    cur_leader: 0,
+                    data: vec![],
+                    msg_type: MessageType::BroadcastQuestion,
+                };
+                let serialized_message_3 = bincode::serialize(&message_3)?;
+
+                println!("Leader {} is dead, checking for a new leader", old_leader);
+
+                for cur_server in server_addresses {
+                    if cur_server != &server_addresses[0] {
+                        socket.send_to(&serialized_message_3, decrement_port(cur_server.clone()))?;
+                    }
+                }
+
+                thread::sleep(Duration::from_secs_f32(rand::random::<f32>() * 6.0 + 3.0));
+
+                if *current_leader_mutex == old_leader {
+                    *current_leader_mutex = 0;
+                    let mut message = ServerMessage {
+                        sender: 0,
+                        client: String::new(),
+                        cur_leader: 0,
+                        data: vec![],
+                        msg_type: MessageType::IAmLeader,
+                    };
+                    let serialized_message = bincode::serialize(&message)?;
+
+                    for cur_server in server_addresses {
+                        if cur_server != &server_addresses[0] {
+                            socket.send_to(&serialized_message, decrement_port(cur_server.clone()))?;
+                        }
+                    }
+
+                    thread::sleep(Duration::from_secs_f32(rand::random::<f32>() * 3.0));
+
+                    if *current_leader_mutex == 0 {
+                        *current_leader_mutex = 0;
+                        message.msg_type = MessageType::Information;
+                        message.cur_leader = *current_leader_mutex;
+                        let serialized_message = bincode::serialize(&message)?;
+
+                        for cur_server in server_addresses {
+                            socket.send_to(&serialized_message, decrement_port(cur_server.clone()))?;
+                        }
+
+                        thread::sleep(Duration::from_secs_f32(rand::random::<f32>() * IMAGE_PROCESSING_DELAY_SECS));
+
+                        let cur_client = "dummy_client"; // Replace with actual logic to extract client info
+                        let processed_key = (cur_client.clone(), 0); // Assuming image size is 0, replace with actual size
+                        let mut processed: HashMap<(String, usize), bool> = HashMap::new();
+
+                        if !processed.contains_key(&processed_key) {
+                            if let Err(err) = write_image_to_file(&vec![]) {
+                                eprintln!("Error writing image data to file: {}", err);
+                            }
+                            processed.insert(processed_key, true);
+                        } else {
+                            println!("Already processed this image");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    socket.set_read_timeout(None)?;
+    Ok(())
+}
+
+fn handle_server_messages(
+    socket_server: &UdpSocket,
+    server_addresses: &[&str],
+    my_index: i32,
+    current_leader: &Arc<Mutex<i32>>,
+    leader_alive: &Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; MAX_BUFFER_SIZE];
+
+    loop {
+        match socket_server.recv_from(&mut buf) {
+            Ok((amt, src)) => {
+                println!("Received {} bytes from: {} at server thread", amt, src);
+
+                if is_serialized_message(&buf) {
+                    let message = match deserialize_message(&buf) {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            eprintln!("Error deserializing message: {}", err);
+                            continue;
+                        }
+                    };
+
+                    println!(
+                        "Message: Sent by: {} to: {} type: {} leader: {}",
+                        message.sender, message.client, message.msg_type as i32, message.cur_leader
+                    );
+
+                    let mut current_leader_mutex = current_leader.lock().expect("Mutex lock failed");
+
+                    match message.msg_type {
+                        MessageType::BroadcastQuestion => {
+                            handle_broadcast_question(socket_server, my_index, server_addresses)
+                                .unwrap_or_else(|err| eprintln!("Error handling broadcast question: {}", err));
+                        }
+                        MessageType::AreLeaderAlive => {
+                            // leader_alive1.store(true, Ordering::SeqCst);
+                        }
+                        MessageType::IAmLeader => {
+                            // ... (Handling logic for IAmLeader)
+                        }
+                        MessageType::Information => {
+                            handle_information(&mut current_leader_mutex, &message);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error receiving data: {}", e);
+            }
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    println!("Starting server...");
+
+    println!("Write the ip:port to bind to:");
+    let mut input_ = String::new();
+    io::stdin().read_line(&mut input_)?;
+
+    let input_server = input_.trim().to_string();
+    let server_address = input_server.clone().to_string();
+
+    let socket = UdpSocket::bind(input_server.clone()).expect("Failed to bind socket");
+    let socket_server = UdpSocket::bind(decrement_port(&input_server.clone())).expect("Failed to bind socket");
+
+    let my_index: i32 = SERVER_ADDRESSES.iter().position(|&s| s == server_address).unwrap() as i32;
+
+    // Create an Arc to safely share data between threads.
+    let current_leader = Arc::new(Mutex::new(INITIAL_LEADER));
+    let leader_alive = Arc::new(AtomicBool::new(false));
+
+    let leader_alive1 = Arc::clone(&leader_alive);
+    let leader_alive2 = Arc::clone(&leader_alive);
+    let current_leader_clone1 = Arc::clone(&current_leader);
+    let current_leader_clone2 = Arc::clone(&current_leader);
+
+    let handle_server = thread::spawn(move || {
+        handle_server_messages(&socket_server, &SERVER_ADDRESSES, my_index, &current_leader_clone1, &leader_alive1);
+    });
+
+    let handle = thread::spawn(move || {
+        handle_client_messages(&socket, &SERVER_ADDRESSES, my_index, &current_leader_clone2, &leader_alive2);
+    });
+
+    // Wait for the handling thread to finish.
+    handle.join().expect("Thread join failed");
+    handle_server.join().expect("Thread join failed");
+
+    println!("Shutting down server...");
+
+    Ok(())
+}
