@@ -60,6 +60,9 @@ fn handle_server_messages(
 ) {
     let mut buf = [0u8; 65507];
 
+    // Keep track of the last time the leader was changed
+    let mut last_leader_change = Instant::now();
+
     loop {
         match socket_server.recv_from(&mut buf) {
             Ok((amt, src)) => {
@@ -106,6 +109,14 @@ fn handle_server_messages(
             Err(e) => {
                 eprintln!("Error receiving data: {}", e);
             }
+        }
+
+        // Check if it's time to change the leader
+        if last_leader_change.elapsed() >= Duration::from_secs(30) {
+            let mut current_leader_mutex = current_leader.lock().expect("Mutex lock failed");
+            *current_leader_mutex = (my_index + 1) % server_addresses.len() as i32;
+            println!("Changing leader to: {}", *current_leader_mutex);
+            last_leader_change = Instant::now();
         }
     }
 }
@@ -291,7 +302,8 @@ fn main() -> io::Result<()> {
     let my_index: i32 = server_addresses.iter().position(|&s| s == server_address).unwrap() as i32;
 
     // Create an Arc to safely share data between threads.
-    let current_leader = Arc::new(Mutex::new(0));
+  //  let current_leader = Arc::new(Mutex::new(0));
+    let current_leader = Arc::new(Mutex::new(my_index));
     let leader_alive = Arc::new(AtomicBool::new(false));
 
     let leader_alive1 = Arc::clone(&leader_alive);
@@ -299,10 +311,13 @@ fn main() -> io::Result<()> {
     let current_leader_clone1 = Arc::clone(&current_leader);
     let current_leader_clone2 = Arc::clone(&current_leader);
 
-    let handle_server = thread::spawn(move || {
+  /*  let handle_server = thread::spawn(move || {
         handle_server_messages(&socket_server, server_addresses, my_index, &current_leader_clone1, &leader_alive1);
+    });*/
+      let handle_server = thread::spawn(move || {
+        handle_server_messages(&socket_server, server_addresses, my_index, &current_leader, &leader_alive1);
     });
-
+    
     let handle = thread::spawn(move || {
         handle_client_messages(&socket, server_addresses, my_index, &current_leader_clone2, &leader_alive2);
     });
