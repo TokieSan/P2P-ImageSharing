@@ -61,7 +61,7 @@ fn main() -> io::Result<()> {
     let mut input = String::new();
 
     loop {
-        println!("Enter a command (e.g., 'send <image_name>', 'list', or 'listen'): ");
+        println!("Enter a command (e.g., 'send <image_name>'): ");
         io::stdin().read_line(&mut input)?;
 
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
