@@ -1,12 +1,13 @@
 use std::io;
 use std::cmp::max;
-use std::time::Duration;
-use std::net::UdpSocket;
-use std::io::{Write, Result};
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{UdpSocket, SocketAddr};
+use std::io::{Read, Write, Result};
 use std::thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::fs::File;
+use std::fs::{File, create_dir_all};
 use chrono::Utc;
 use serde::{Serialize, Deserialize};
 use bincode;
@@ -50,6 +51,49 @@ fn decrement_port(addr: &str) -> String {
     format!("{}:{}", ip, port.iter().collect::<String>())
 }
 
+fn is_leader_alive(
+    socket: &UdpSocket,
+    message: &mut ServerMessage,
+    server_addresses: &&[&str],
+    current_leader: Arc<Mutex<i32>>,
+) -> bool {
+    message.msg_type = 3;
+    let serialized_message = bincode::serialize(&message).unwrap();
+    socket
+        .send_to(
+            &serialized_message,
+            server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize].clone(),
+        )
+        .expect("Failed to send message");
+
+    let mut buf_2 = [0u8; 65507];
+
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("Failed to set read timeout");
+
+    match socket.recv_from(&mut buf_2) {
+        Ok((amt_2, src_2)) => {
+            let message_2 = deserialize_message(&buf_2).unwrap();
+            println!(
+                "Message: Sent by: {} to: {} type: {} leader: {}",
+                message_2.sender, message_2.client, message_2.msg_type, message_2.cur_leader
+            );
+            if message_2.msg_type == 3 {
+                println!("Leader is alive");
+            } else {
+                println!("Collision happened");
+            }
+            socket.set_read_timeout(None).expect("set_read_timeout call failed");
+            true 
+        }
+        Err(_) => {
+            socket.set_read_timeout(None).expect("set_read_timeout call failed");
+            false
+        }
+    }
+}
+
 fn handle_server_messages(
     socket_server: &UdpSocket,
     server_addresses: &[&str],
@@ -71,7 +115,7 @@ fn handle_server_messages(
                     );
 
                     let mut current_leader_mutex = current_leader.lock().expect("Mutex lock failed");
-                    let response = ServerMessage {
+                    let mut response = ServerMessage {
                         sender: my_index,
                         client: message.client.clone(),
                         cur_leader: *current_leader_mutex,
@@ -90,7 +134,7 @@ fn handle_server_messages(
                             )
                             .expect("Failed to send response");
                     } else if response.msg_type == 3 {
-                        // leader_alive1.store(true, Ordering::SeqCst);
+                        *current_leader.lock().unwrap() = max(*current_leader.lock().unwrap(), message.sender);
                     } else if response.msg_type == 2 {
                         // information
                         *current_leader_mutex = max(*current_leader_mutex, message.cur_leader);
@@ -98,6 +142,14 @@ fn handle_server_messages(
                             "Information received from: {} that {} is the leader",
                             message.sender, *current_leader_mutex
                         );
+                        response.msg_type = 3;
+                        let serialized_response = bincode::serialize(&response).unwrap();
+                        socket_server
+                            .send_to(
+                                &serialized_response,
+                                decrement_port(server_addresses[message.sender as usize]),
+                            )
+                            .expect("Failed to send response");
                     }
                 }
             }
@@ -106,6 +158,51 @@ fn handle_server_messages(
             }
         }
     }
+}
+
+fn handle_image_save(
+    processed: &mut HashMap<(String, usize), bool>,
+    src: &SocketAddr,
+    buf: &[u8],
+    amt: usize,
+) {
+    let cur_client = src.to_string().split(':').next().unwrap().to_owned();
+    if !processed.contains_key(&(cur_client.clone(), amt)) {
+        if let Err(err) = write_image_to_file(&buf[..amt]) {
+            eprintln!("Error writing image data to file: {}", err);
+        }
+        processed.insert((cur_client, amt), true);
+    } else {
+        println!("Already processed this image");
+    }
+
+}
+
+fn get_new_leader(
+    socket: &UdpSocket,
+    server_addresses: &[&str],
+    current_leader: &Arc<Mutex<i32>>,
+    my_index: i32,
+) -> i32 {
+    let message = ServerMessage {
+        sender: my_index,
+        msg_type: 2,
+        cur_leader: my_index,
+        client: "".to_string(),
+        data: vec![],
+    };
+    let serialized_message_3 = bincode::serialize(&message).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout call failed");
+    for cur_server in server_addresses {
+        if cur_server != &server_addresses[my_index as usize] {
+            socket.send_to(&serialized_message_3, decrement_port(cur_server.clone()))
+                .expect("Failed to send message");
+            std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0));
+            *current_leader.lock().unwrap() = max(my_index, *current_leader.lock().unwrap());
+        }
+    }
+    println!("New leader is: {}", *current_leader.lock().unwrap());
+    *current_leader.lock().unwrap()
 }
 
 fn handle_client_messages(
@@ -134,110 +231,22 @@ fn handle_client_messages(
 
                     let serialized_message = bincode::serialize(&message).unwrap();
 
-                    if *current_leader.lock().expect("Mutex lock failed") == -1 {
-                        for cur_server in server_addresses {
-                            if cur_server != &server_addresses[my_index as usize] {
-                                socket.send_to(&serialized_message, decrement_port(cur_server))
-                                    .expect("Failed to send message");
-                            }
-                        }
-                    }
-
                     std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 6.0 + 3.0));
 
-                    if *current_leader.lock().expect("Mutex lock failed") == my_index
-                        || *current_leader.lock().expect("Mutex lock failed") == -1
-                    {
-                        let cur_client = src.to_string().split(':').next().unwrap().to_owned();
-                        if !processed.contains_key(&(cur_client.clone(), amt)) {
-                            if let Err(err) = write_image_to_file(&buf[..amt]) {
-                                eprintln!("Error writing image data to file: {}", err);
-                            }
-                            processed.insert((cur_client, amt), true);
-                        } else {
-                            println!("Already processed this image");
-                        }
-                        *current_leader.lock().expect("Mutex lock failed") = my_index;
-                        message.msg_type = 2;
-                        message.cur_leader = *current_leader.lock().expect("Mutex lock failed");
-                        let serialized_message = bincode::serialize(&message).unwrap();
-
-                        for cur_server in server_addresses {
-                            socket.send_to(&serialized_message, decrement_port(cur_server))
-                                .expect("Failed to send message");
-                        }
+                    if *current_leader.lock().expect("Mutex lock failed") == my_index {
+                        handle_image_save(&mut processed, &src, &buf, amt);
                     } else {
-                        message.msg_type = 3;
-                        socket.send_to(&serialized_message, server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize])
-                            .expect("Failed to send message");
+                        if !is_leader_alive(&socket, &mut message, &server_addresses, Arc::clone(&current_leader)) {
+                            println!("Leader is dead");
+                            let old_leader = *current_leader.lock().expect("Mutex lock failed");
 
-                        let mut buf_2 = [0u8; 65507];
+                            let leader_new = get_new_leader(&socket, &server_addresses, &Arc::clone(&current_leader), my_index);
 
-                        socket.set_read_timeout(Some(Duration::from_secs(3)))
-                            .expect("Failed to set read timeout");
-
-                        match socket.recv_from(&mut buf_2) {
-                            Ok((_amt_2, _src_2)) => {
-                                let message_2 = deserialize_message(&buf_2).unwrap();
-                                println!(
-                                    "Message: Sent by: {} to: {} type: {} leader: {}",
-                                    message_2.sender, message_2.client, message_2.msg_type, message_2.cur_leader
-                                );
-                                if message_2.msg_type == 3 {
-                                    println!("Leader is alive");
-                                } else {
-                                    println!("collision happened");
-                                }
-                            }
-                            Err(_) => {
-                                let old_leader = *current_leader.lock().expect("Mutex lock failed");
-                                let message_3 = ServerMessage {
-                                    sender: my_index,
-                                    msg_type: 0,
-                                    cur_leader: my_index,
-                                    client: src.clone().to_string(),
-                                    data: vec![],
-                                };
-                                let serialized_message_3 = bincode::serialize(&message_3).unwrap();
-                                println!("Leader {} is dead, I will see if there is some leader set", old_leader);
-
-                                for cur_server in server_addresses {
-                                    if cur_server != &server_addresses[my_index as usize] {
-                                        socket.send_to(&serialized_message_3, decrement_port(cur_server))
-                                            .expect("Failed to send message");
-                                    }
-                                }
-
-                                std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0 + 1.0));
-
-                                if *current_leader.lock().expect("Mutex lock failed") == old_leader {
-                                    *current_leader.lock().expect("Mutex lock failed") = my_index;
-                                    message.msg_type = 2;
-                                    message.cur_leader = *current_leader.lock().expect("Mutex lock failed");
-                                    let serialized_message = bincode::serialize(&message).unwrap();
-
-                                    for cur_server in server_addresses {
-                                        if cur_server != &server_addresses[my_index as usize] {
-                                            socket.send_to(&serialized_message, decrement_port(cur_server))
-                                                .expect("Failed to send message");
-                                        }
-                                    }
-
-                                    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 3.0));
-
-                                    let cur_client = src.to_string().split(':').next().unwrap().to_owned();
-                                    if !processed.contains_key(&(cur_client.clone(), amt)) {
-                                        if let Err(err) = write_image_to_file(&buf[..amt]) {
-                                            eprintln!("Error writing image data to file: {}", err);
-                                        }
-                                        processed.insert((cur_client, amt), true);
-                                    } else {
-                                        println!("Already processed this image");
-                                    }
-                                }
+                            if leader_new == my_index {
+                                handle_image_save(&mut processed, &src, &buf, amt);
                             }
                         }
-                        socket.set_read_timeout(None).expect("Failed to set read timeout");
+                        socket.set_read_timeout(None).expect("set_read_timeout call failed");
                     }
                 } else {
                     // Received a message from a server.
@@ -247,7 +256,7 @@ fn handle_client_messages(
                         message.sender, message.client, message.msg_type, message.cur_leader
                     );
 
-                    let response = ServerMessage {
+                    let mut response = ServerMessage {
                         sender: my_index,
                         client: message.client.clone(),
                         cur_leader: *current_leader.lock().expect("Mutex lock failed"),
@@ -287,6 +296,7 @@ fn main() -> io::Result<()> {
 
     // Create an Arc to safely share data between threads.
     let current_leader = Arc::new(Mutex::new(0));
+
     let current_leader_clone1 = Arc::clone(&current_leader);
     let current_leader_clone2 = Arc::clone(&current_leader);
 
