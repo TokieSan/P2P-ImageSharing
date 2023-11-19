@@ -50,55 +50,12 @@ fn decrement_port(addr: &str) -> String {
     format!("{}:{}", ip, port.iter().collect::<String>())
 }
 
-fn is_leader_alive(
-    socket: &UdpSocket,
-    message: &mut ServerMessage,
-    server_addresses: &&[&str],
-    current_leader: Arc<Mutex<i32>>,
-) -> bool {
-    message.msg_type = 3;
-    let serialized_message = bincode::serialize(&message).unwrap();
-    socket
-        .send_to(
-            &serialized_message,
-            server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize],
-        )
-        .expect("Failed to send message");
-
-    let mut buf_2 = [0u8; 65507];
-
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("Failed to set read timeout");
-
-    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0 + 1.0));
-    match socket.recv_from(&mut buf_2) {
-        Ok((_amt_2, _src_2)) => {
-            let message_2 = deserialize_message(&buf_2).unwrap();
-            println!(
-                "Message: Sent by: {} to: {} type: {} leader: {}",
-                message_2.sender, message_2.client, message_2.msg_type, message_2.cur_leader
-            );
-            if message_2.msg_type == 3 {
-                println!("Leader is alive");
-            } else {
-                println!("Collision happened");
-            }
-            socket.set_read_timeout(None).expect("set_read_timeout call failed");
-            true 
-        }
-        Err(_) => {
-            socket.set_read_timeout(None).expect("set_read_timeout call failed");
-            false
-        }
-    }
-}
-
 fn handle_server_messages(
     socket_server: &UdpSocket,
     server_addresses: &[&str],
     my_index: i32,
     current_leader: &Arc<Mutex<i32>>,
+    leader_alive: &Arc<Mutex<bool>>,
 ) {
     let mut buf = [0u8; 65507];
 
@@ -150,7 +107,20 @@ fn handle_server_messages(
                                 decrement_port(server_addresses[message.sender as usize]),
                             )
                             .expect("Failed to send response");
-                    }
+                        } else if message.msg_type == 4 {
+                            response.msg_type = 5; // response declaring leader is here
+                            *leader_alive.lock().unwrap() = true;
+                            socket_server
+                                .send_to(
+                                    &buf,
+                                    decrement_port(server_addresses[message.sender as usize]),
+                                )
+                                .expect("Failed to send response");
+
+
+                        } else if message.msg_type == 5 {
+                            *leader_alive.lock().unwrap() = true;
+                        }
                 }
             }
             Err(e) => {
@@ -192,6 +162,7 @@ fn get_new_leader(
         data: vec![],
     };
     let serialized_message_3 = bincode::serialize(&message).unwrap();
+    let old_leader = *current_leader.lock().unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout call failed");
     let mut act_leader = my_index;
     std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0));
@@ -200,13 +171,55 @@ fn get_new_leader(
             socket.send_to(&serialized_message_3, decrement_port(cur_server))
                 .expect("Failed to send message");
             std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 8.0));
-            act_leader = max(act_leader, *current_leader.lock().unwrap());
+            if old_leader != *current_leader.lock().unwrap() {
+                act_leader = max(act_leader, *current_leader.lock().unwrap());
+            }
         }
     }
     println!("New leader is: {}", act_leader);
     *current_leader.lock().unwrap() = act_leader;
-    socket.set_read_timeout(None).expect("set_read_timeout call failed");
     act_leader
+}
+
+fn is_leader_alive(
+    socket: &UdpSocket,
+    message: &mut ServerMessage,
+    server_addresses: &&[&str],
+    current_leader: &Arc<Mutex<i32>>,
+    leader_alive: &Arc<Mutex<bool>>,
+) -> bool {
+    message.msg_type = 3;
+    let serialized_message = bincode::serialize(&message).unwrap();
+    *leader_alive.lock().unwrap() = false;
+    socket
+        .send_to(
+            &serialized_message,
+            server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize],
+        )
+        .expect("Failed to send message");
+
+    let mut buf_2 = [0u8; 65507];
+    
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("Failed to set read timeout");
+
+    match socket.recv_from(&mut buf_2) {
+        Ok((_amt_2, _src_2)) => {
+            let message_2 = deserialize_message(&buf_2).unwrap();
+            *leader_alive.lock().unwrap() = true;
+            if message_2.msg_type == 3 {
+                println!("Leader is alive");
+            } else {
+                println!("Collision happened");
+            }
+            true 
+        }
+        Err(_) => {
+            *leader_alive.lock().unwrap() = false;
+            false
+        }
+    }
 }
 
 fn handle_client_messages(
@@ -214,6 +227,7 @@ fn handle_client_messages(
     server_addresses: &[&str],
     my_index: i32,
     current_leader: &Arc<Mutex<i32>>,
+    leader_alive: &Arc<Mutex<bool>>,
 ) {
     let mut buf = [0u8; 65507];
     let mut processed: HashMap<(String, usize), bool> = HashMap::new();
@@ -236,24 +250,22 @@ fn handle_client_messages(
                     if *current_leader.lock().expect("Mutex lock failed") == my_index {
                         handle_image_save(&mut processed, &src, &buf, amt);
                     } else {
-                        if !is_leader_alive(&socket, &mut message, &server_addresses, Arc::clone(&current_leader)) {
-                            println!("Leader is dead");
+                        if !is_leader_alive(&socket, &mut message, &server_addresses, &Arc::clone(&current_leader), &Arc::clone(&leader_alive)) {
+                            println!("Leader is dead, getting new leader");
                             let leader_new = get_new_leader(&socket, &server_addresses, &Arc::clone(&current_leader), my_index);
 
                             if leader_new == my_index {
                                 handle_image_save(&mut processed, &src, &buf, amt);
                             }
                         }
-                        socket.set_read_timeout(None).expect("set_read_timeout call failed");
                     }
                 } else {
-                    // Received a message from a server.
+                    // Received a message from a server checking if leader, me,  is alive.
                     let message: ServerMessage = bincode::deserialize(&buf[..amt]).unwrap();
                     println!(
-                        "Message: Sent by: {} to: {} type: {} leader: {}",
+                        "Message: Sent by: {} to: {} type: {} leader: {} assuring I am alive. I am.",
                         message.sender, message.client, message.msg_type, message.cur_leader
                     );
-                    *current_leader.lock().unwrap() = max(*current_leader.lock().unwrap(), message.cur_leader);
 
                     let response = ServerMessage {
                         sender: my_index,
@@ -269,7 +281,7 @@ fn handle_client_messages(
                 }
             }
             Err(e) => {
-                eprintln!("Error receiving data: {}", e);
+                //eprintln!("Error receiving data: {}", e);
             }
         }
     }
@@ -297,12 +309,16 @@ fn main() -> io::Result<()> {
     let current_leader_clone1 = Arc::clone(&current_leader);
     let current_leader_clone2 = Arc::clone(&current_leader);
 
+    let leader_alive = Arc::new(Mutex::new(true));
+    let leader_alive_clone1 = Arc::clone(&leader_alive);
+    let leader_alive_clone2 = Arc::clone(&leader_alive);
+
     let handle_server = thread::spawn(move || {
-        handle_server_messages(&socket_server, server_addresses, my_index, &current_leader_clone1);
+        handle_server_messages(&socket_server, server_addresses, my_index, &current_leader_clone1, &leader_alive_clone1);
     });
 
     let handle = thread::spawn(move || {
-        handle_client_messages(&socket, server_addresses, my_index, &current_leader_clone2);
+        handle_client_messages(&socket, server_addresses, my_index, &current_leader_clone2, &leader_alive_clone2);
     });
 
     let debugging_thread = thread::spawn(move || {
