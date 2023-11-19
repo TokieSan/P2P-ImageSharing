@@ -10,7 +10,7 @@ use std::fs::File;
 use chrono::Utc;
 use serde::{Serialize, Deserialize};
 use bincode;
-
+use std::process::Command;
 #[derive(Serialize, Deserialize, Debug)]
 struct ServerMessage {
     sender: i32,
@@ -31,7 +31,31 @@ fn deserialize_message(data: &[u8]) -> Result<ServerMessage> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+fn encrypt_image() -> Result<()> {
+    let python_script = "Enc.py";
+
+    // Run the Python script to generate the key and encrypt the image
+    let output = Command::new("/usr/bin/python3") // Replace with the actual path to your Python interpreter
+        .arg(python_script)
+        .output()
+        .expect("Failed to execute command");
+
+    // Print the output
+    println!("Output: {}", String::from_utf8_lossy(&output.stdout));
+
+    // Check if there was an error
+    /*if !output.status.success() {
+        eprintln!("Error: {}", String::from_utf8_lossy(&output.stderr));
+        return Err("Encryption failed".into());
+    }*/
+
+    
+
+    Ok(())
+}
+
 fn write_image_to_file(data: &[u8]) -> Result<()> {
+
     let current_datetime = Utc::now().to_rfc3339();
     let filename = format!("received_{}.jpg", current_datetime);
     let filename_clone = filename.clone();
@@ -39,6 +63,9 @@ fn write_image_to_file(data: &[u8]) -> Result<()> {
     file.write_all(data)?;
 
     println!("Image saved as: {}", filename_clone);
+    // Encrypt the image
+    encrypt_image()?;
+
     Ok(())
 }
 
