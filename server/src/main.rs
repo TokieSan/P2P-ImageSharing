@@ -1,13 +1,12 @@
 use std::io;
 use std::cmp::max;
-use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::net::{UdpSocket, SocketAddr};
-use std::io::{Read, Write, Result};
+use std::io::{Write, Result};
 use std::thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::fs::{File, create_dir_all};
+use std::fs::File;
 use chrono::Utc;
 use serde::{Serialize, Deserialize};
 use bincode;
@@ -62,7 +61,7 @@ fn is_leader_alive(
     socket
         .send_to(
             &serialized_message,
-            server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize].clone(),
+            server_addresses[*current_leader.lock().expect("Mutex lock failed") as usize],
         )
         .expect("Failed to send message");
 
@@ -72,8 +71,9 @@ fn is_leader_alive(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("Failed to set read timeout");
 
+    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0 + 1.0));
     match socket.recv_from(&mut buf_2) {
-        Ok((amt_2, src_2)) => {
+        Ok((_amt_2, _src_2)) => {
             let message_2 = deserialize_message(&buf_2).unwrap();
             println!(
                 "Message: Sent by: {} to: {} type: {} leader: {}",
@@ -133,11 +133,11 @@ fn handle_server_messages(
                                 decrement_port(server_addresses[message.sender as usize]),
                             )
                             .expect("Failed to send response");
-                    } else if response.msg_type == 3 {
-                        *current_leader.lock().unwrap() = max(*current_leader.lock().unwrap(), message.sender);
-                    } else if response.msg_type == 2 {
+                    } else if message.msg_type == 3 {
+                        //*current_leader.lock().unwrap() = max(*current_leader.lock().unwrap(), message.sender);
+                    } else if message.msg_type == 2 {
                         // information
-                        *current_leader_mutex = max(*current_leader_mutex, message.cur_leader);
+                        *current_leader_mutex = max(*current_leader_mutex, message.sender);
                         println!(
                             "Information received from: {} that {} is the leader",
                             message.sender, *current_leader_mutex
@@ -193,16 +193,20 @@ fn get_new_leader(
     };
     let serialized_message_3 = bincode::serialize(&message).unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout call failed");
+    let mut act_leader = my_index;
+    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0));
     for cur_server in server_addresses {
         if cur_server != &server_addresses[my_index as usize] {
-            socket.send_to(&serialized_message_3, decrement_port(cur_server.clone()))
+            socket.send_to(&serialized_message_3, decrement_port(cur_server))
                 .expect("Failed to send message");
-            std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 2.0));
-            *current_leader.lock().unwrap() = max(my_index, *current_leader.lock().unwrap());
+            std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 8.0));
+            act_leader = max(act_leader, *current_leader.lock().unwrap());
         }
     }
-    println!("New leader is: {}", *current_leader.lock().unwrap());
-    *current_leader.lock().unwrap()
+    println!("New leader is: {}", act_leader);
+    *current_leader.lock().unwrap() = act_leader;
+    socket.set_read_timeout(None).expect("set_read_timeout call failed");
+    act_leader
 }
 
 fn handle_client_messages(
@@ -229,17 +233,11 @@ fn handle_client_messages(
                         data: buf[..amt].to_vec(),
                     };
 
-                    let serialized_message = bincode::serialize(&message).unwrap();
-
-                    std::thread::sleep(std::time::Duration::from_secs_f32(rand::random::<f32>() * 6.0 + 3.0));
-
                     if *current_leader.lock().expect("Mutex lock failed") == my_index {
                         handle_image_save(&mut processed, &src, &buf, amt);
                     } else {
                         if !is_leader_alive(&socket, &mut message, &server_addresses, Arc::clone(&current_leader)) {
                             println!("Leader is dead");
-                            let old_leader = *current_leader.lock().expect("Mutex lock failed");
-
                             let leader_new = get_new_leader(&socket, &server_addresses, &Arc::clone(&current_leader), my_index);
 
                             if leader_new == my_index {
@@ -255,16 +253,15 @@ fn handle_client_messages(
                         "Message: Sent by: {} to: {} type: {} leader: {}",
                         message.sender, message.client, message.msg_type, message.cur_leader
                     );
+                    *current_leader.lock().unwrap() = max(*current_leader.lock().unwrap(), message.cur_leader);
 
-                    let mut response = ServerMessage {
+                    let response = ServerMessage {
                         sender: my_index,
                         client: message.client.clone(),
                         cur_leader: *current_leader.lock().expect("Mutex lock failed"),
                         data: vec![],
                         msg_type: 3,
                     };
-
-                    *current_leader.lock().expect("Mutex lock failed") = my_index;
 
                     let serialized_response = bincode::serialize(&response).unwrap();
                     socket.send_to(&serialized_response, server_addresses[message.sender as usize])
@@ -308,9 +305,17 @@ fn main() -> io::Result<()> {
         handle_client_messages(&socket, server_addresses, my_index, &current_leader_clone2);
     });
 
+    let debugging_thread = thread::spawn(move || {
+        loop {
+            println!("[DEBUG] Current leader: {}", *current_leader.lock().unwrap());
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+
     // Wait for the handling thread to finish.
     handle.join().expect("Thread join failed");
     handle_server.join().expect("Thread join failed");
+    debugging_thread.join().expect("Thread join failed");
 
     println!("Shutting down server...");
 
