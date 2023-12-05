@@ -2,7 +2,7 @@ use std::io;
 use std::cmp::max;
 use std::time::Duration;
 use std::net::{UdpSocket, SocketAddr};
-use std::io::{Write, Result};
+use std::io::{Read,Write, Result};
 use std::thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ fn deserialize_message(data: &[u8]) -> Result<ServerMessage> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-fn encrypt_image() -> Result<()> {
+fn encrypt_image(image_name: &str, client_address: &SocketAddr) -> Result<()> {
     let python_script = "Enc.py";
 
     // Run the Python script to generate the key and encrypt the image
@@ -43,28 +43,31 @@ fn encrypt_image() -> Result<()> {
     // Print the output
     println!("Output: {}", String::from_utf8_lossy(&output.stdout));
 
-    // Check if there was an error
-    /*if !output.status.success() {
-        eprintln!("Error: {}", String::from_utf8_lossy(&output.stderr));
-        return Err("Encryption failed".into());
-    }*/
+if output.status.success() {
+        // Derive file names based on the image name
+        let enc_file = format!("{}.enc", image_name);
+        let key_file = format!("{}.enc.key", image_name);
+        
+        let socket = UdpSocket::bind("0.0.0.0:8886").expect("Failed to bind socket");
+        socket.send_to(&enc_file.as_bytes(), client_address)?;
+        socket.send_to(&key_file.as_bytes(), client_address)?;
+}
+        Ok(())
 
-    
-
-    Ok(())
 }
 
-fn write_image_to_file(data: &[u8]) -> Result<()> {
+fn write_image_to_file(data: &[u8], src: &SocketAddr) -> Result<()> {
 
     let current_datetime = Utc::now().to_rfc3339();
-    let filename = format!("received_{}.jpg", current_datetime);
+    let address_str = src.to_string();
+    let filename = format!("{}_received_{}.png", address_str, current_datetime);
     let filename_clone = filename.clone();
-    let mut file = File::create(filename)?;
+    let mut file = File::create(filename.clone())?;
     file.write_all(data)?;
 
     println!("Image saved as: {}", filename_clone);
     // Encrypt the image
-    encrypt_image()?;
+    encrypt_image(&filename, src)?;
 
     Ok(())
 }
@@ -165,7 +168,7 @@ fn handle_image_save(
 ) {
     let cur_client = src.to_string().split(':').next().unwrap().to_owned();
     if !processed.contains_key(&(cur_client.clone(), amt)) {
-        if let Err(err) = write_image_to_file(&buf[..amt]) {
+        if let Err(err) = write_image_to_file(&buf[..amt], &src) {
             eprintln!("Error writing image data to file: {}", err);
         }
         processed.insert((cur_client, amt), true);
@@ -226,7 +229,7 @@ fn is_leader_alive(
         .expect("Failed to send message");
 
     let mut buf_2 = [0u8; 65507];
-    
+   
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("Failed to set read timeout");
@@ -240,7 +243,7 @@ fn is_leader_alive(
             } else {
                 println!("Collision happened");
             }
-            true 
+            true
         }
         Err(_) => {
             *leader_alive.lock().unwrap() = false;
