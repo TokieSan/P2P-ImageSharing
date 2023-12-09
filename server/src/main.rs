@@ -20,6 +20,16 @@ struct ServerMessage {
     msg_type: i32, // 0 broadcast question, 1 information, 2 i am leader, 3 are leader alive
 }
 
+fn handle_list_command(processed: &HashMap<(String, usize), bool>) -> String {
+    let mut client_list = String::new();
+    let mut i = 0;
+    for (client, _) in processed.keys() {
+        client_list.push_str(&format!("Client {}: {}\n", i, client));
+        i += 1;
+    }
+    client_list
+}
+
 // Function to determine if the message is serialized or direct.
 fn is_serialized_message(data: &[u8]) -> bool {
     deserialize_message(&data).is_ok()
@@ -55,7 +65,6 @@ fn encrypt_image() -> Result<()> {
 }
 
 fn write_image_to_file(data: &[u8]) -> Result<()> {
-
     let current_datetime = Utc::now().to_rfc3339();
     let filename = format!("received_{}.jpg", current_datetime);
     let filename_clone = filename.clone();
@@ -163,7 +172,7 @@ fn handle_image_save(
     buf: &[u8],
     amt: usize,
 ) {
-    let cur_client = src.to_string().split(':').next().unwrap().to_owned();
+    let cur_client = src.to_string().to_owned();
     if !processed.contains_key(&(cur_client.clone(), amt)) {
         if let Err(err) = write_image_to_file(&buf[..amt]) {
             eprintln!("Error writing image data to file: {}", err);
@@ -265,7 +274,14 @@ fn handle_client_messages(
                 println!("Received {} bytes from: {} at clients thread", amt, src);
 
                 if !is_serialized_message(&buf) {
-                    // Received an image from a client.
+
+                    let command = String::from_utf8_lossy(&buf[..amt]);
+                    if command != "" && command == "list" {
+                        let client_list = handle_list_command(&processed);
+                        let _ = socket.send_to(&client_list.as_bytes(), src);
+                        continue;
+                    }
+                    
                     let mut message = ServerMessage {
                         sender: my_index,
                         msg_type: 0,
