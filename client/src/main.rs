@@ -3,6 +3,7 @@ use std::thread;
 use chrono;
 use core::time::Duration;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use std::net::UdpSocket;
 use std::env;
@@ -27,6 +28,7 @@ use glob::{glob_with, MatchOptions};
 use error_chain::error_chain;
 use rouille::Response;
 use rouille::Server;
+use uuid::Uuid;
 
 fn get_files_in_directory(path: &str) -> io::Result<Vec<String>> {
     // Get a list of all entries in the folder
@@ -51,8 +53,6 @@ fn get_files_in_directory(path: &str) -> io::Result<Vec<String>> {
 
 fn serve_static_file(route: &str) -> Response {
   let file_path = format!(".{}", route);
-  println!("file_path: {}", file_path);
-
   Response::from_file("image/png", File::open(file_path).unwrap())
 }
 
@@ -70,6 +70,9 @@ fn handle_server() {
         image_resp = image_resp.with_content_disposition_attachment("image.png");
     }
 
+
+    let mut view_counts: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+
     // Get all image files in current directory
     let server = Server::new("127.0.0.1:8080", move |request| {
         let route = request.url();
@@ -78,28 +81,75 @@ fn handle_server() {
         if route.starts_with("/static/") {
             return serve_static_file(route.as_str());
         }
-                
-        let mut html = String::from(r#"<html><head><style>
-    #grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      grid-gap: 10px;
-    }
-    img {
-      width: 200px; 
-      height: 200px; 
-      object-fit: cover;
-      filter: blur(5px);
-    }
-  </style></head><body>
-    <div id="grid">"#);
 
+        let view_count_1 = Arc::clone(&view_counts);
+        let view_count_2 = Arc::clone(&view_counts);
+
+        if route.starts_with("/temp/") {
+            let mut view_count = view_count_1.lock().unwrap();
+            let entry = view_count.entry(route.to_string()).or_insert(0);
+            let mut file_name = route.replace("/temp/", "");
+            let mut image_path = format!("/static/{}", file_name);
+
+            if *entry >= 5 || *entry == -1 {
+                image_path = format!("/static/blank.jpg");
+                file_name = "blank.jpg".to_string();
+            } else {
+                *entry += 1;
+            }
+
+
+            let image_url = format!("/temp/{}", file_name);
+            let view_count_text = format!("View Count: {}", entry);
+
+            let html = format!(r#"
+                <html>
+                    <head>
+                        <style>
+                            img {{
+                                width: 1000px;
+                                height: 1000px;
+                                object-fit: cover;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <img src="{}" />
+                        <p>{}</p>
+                        <a href="{}">Request Image</a>
+                    </body>
+                </html>
+                 "#, image_path, view_count_text, image_url);
+
+            return Response::html(html);
+        }
+
+        let mut html = String::from(r#"<html><head><style>
+           #grid {
+             display: grid;
+             grid-template-columns: repeat(4, 1fr);
+             grid-gap: 10px;
+           }
+           img {
+             width: 200px; 
+             height: 200px; 
+             object-fit: cover;
+             filter: blur(5px);
+           }
+           </style></head><body>
+           <div id="grid">"#);
+        
         for img in &images {
             let filename = img.split('/').last().unwrap(); 
+
+            //view_count_2.lock().unwrap().insert(format!("/temp/{}", filename), 0);
+
             html.push_str(&format!(r#"<div>
-        <img src="/static/{}" />
-        <p style="text-align:center;">{}</p>  
-      </div>"#, img, filename));
+               <img src="/static/{}" />  
+               <p>{}</p>
+               <a href="{}">Request Image</a> 
+               </div>"#, img, filename, format!("/temp/{}", filename)));
+
         }
 
         html.push_str(r#"</div></body></html>"#);
