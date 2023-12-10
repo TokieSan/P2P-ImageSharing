@@ -61,8 +61,9 @@ fn handle_server(view_counts: Arc<Mutex<HashMap<String, i32>>>) {
     let entries = async_std::fs::read_dir("./");
     // Extract the filenames from the directory entries and store them in a vector
     let mut images = get_files_in_directory("./").unwrap();
-    // only get PNG and JPG files
+    // only get PNG and JPG files except files with the word blank
     images.retain(|x| x.contains(".png") || x.contains(".jpg"));
+    images.retain(|x| !x.contains("blank"));
 
     for u in &images {
         //println!("Found image {:?}", u);
@@ -84,15 +85,15 @@ fn handle_server(view_counts: Arc<Mutex<HashMap<String, i32>>>) {
 
         if route.starts_with("/temp/") {
             let mut view_count = view_count_1.lock().unwrap();
-            let entry = view_count.entry(route.to_string()).or_insert(6);
+            let entry = view_count.entry(route.to_string()).or_insert(0);
             let mut file_name = route.replace("/temp/", "");
             let mut image_path = format!("/static/{}", file_name);
 
-            if *entry >= 5 || *entry == -1 {
+            if *entry <= 0 {
                 image_path = format!("/static/blank.jpg");
                 file_name = "blank.jpg".to_string();
             } else {
-                *entry += 1;
+                *entry -= 1;
             }
 
 
@@ -291,7 +292,7 @@ fn main() -> io::Result<()> {
 
     let handle_input = thread::spawn(move || {
         loop {
-            //println!("Enter a command (e.g., 'send <image_name>', 'list', 'lease <image_name>', 'request <image_name> <host_ip>): ");
+            //println!("Enter a command (e.g., 'send <image_name>', 'list', 'lease <image_name> <views_count>', 'request <image_name> <host_ip>): ");
             println!("Enter a command (e.g., 'send <image_name>', 'list', 'lease <image_name>'): ");
             io::stdin().read_line(&mut input);
 
@@ -321,7 +322,7 @@ fn main() -> io::Result<()> {
                     socket.set_read_timeout(None);
                 }
                 "lease" => {
-                    view_counts_clone_2.lock().unwrap().insert(format!("/temp/{}", parts[1].to_string()), 0);
+                    view_counts_clone_2.lock().unwrap().insert(format!("/temp/{}", parts[1].to_string()), parts[2].parse::<i32>().unwrap());
                     println!("Lease granted.");
                 }
                 "request" => {
