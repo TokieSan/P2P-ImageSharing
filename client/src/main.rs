@@ -10,7 +10,7 @@ use std::env;
 use std::str;
 use std::fs::File;
 use std::{fs, io};
-
+use webbrowser;
 
 use std::prelude::*;
 use std::path::Path;
@@ -72,7 +72,7 @@ fn handle_server(view_counts: Arc<Mutex<HashMap<String, i32>>>) {
     }
 
     // Get all image files in current directory
-    let server = Server::new("127.0.0.1:8080", move |request| {
+    let server = Server::new("0.0.0.0:8080", move |request| {
         let route = request.url();
 
         // Check if the request is for a static file
@@ -260,15 +260,13 @@ fn send_image_to_server(server_address: &str, image_path: &str, socket: &UdpSock
 fn main() -> io::Result<()> {
     println!("Starting client...");
 
-    let server_addresses = &["127.0.0.1:8887", "127.0.0.1:8888", "127.0.0.1:8889"]; // Replace with the server IPs.
+    let server_addresses = &["0.0.0.0:8887", "127.0.0.1:8888", "127.0.0.1:8889"]; // Replace with the server IPs.
 
     println!("Started successfully, broadcasting on port 8888");
 
     let mut input = String::new();
 
-    let socket_m = Arc::new(Mutex::new(UdpSocket::bind("0.0.0.0:1939").expect("Failed to bind socket")));
-    let socket_clone = socket_m.clone();
-    let socket_clone2 = socket_m.clone();
+    let socket = UdpSocket::bind("0.0.0.0:1939").expect("Failed to bind socket");
 
     let mut view_counts: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
     let view_counts_clone_1 = view_counts.clone();
@@ -278,19 +276,11 @@ fn main() -> io::Result<()> {
         handle_server(view_counts_clone_1);
     });
 
-    let handle_requests_recieved = thread::spawn(move || {
-        let mut buf_2 = [0u8; 65507];
-        loop {
-            //let result = socket_d_clone_1.lock().unwrap().recv_from(&mut buf_2);
-            let result = socket_clone.lock().unwrap().recv_from(&mut buf_2);
-            match result {
-                Ok((amt, src)) => println!("Received request from {}: {}", src, String::from_utf8_lossy(&buf_2[..amt])),
-                Err(err) => eprintln!("Error receiving request: {}", err),
-            }
-        }
-    });
-
     let handle_input = thread::spawn(move || {
+        for server_address in server_addresses {
+            socket.send_to(b"ping", server_address);
+        }
+
         loop {
             //println!("Enter a command (e.g., 'send <image_name>', 'list', 'lease <image_name> <views_count>', 'request <image_name> <host_ip>): ");
             println!("Enter a command (e.g., 'send <image_name>', 'list', 'lease <image_name>'): ");
@@ -302,14 +292,13 @@ fn main() -> io::Result<()> {
                 "send" => {
                     let image_path = parts[1];
                     for server_address in server_addresses {
-                        if let Err(err) = send_image_to_server(server_address, image_path, &socket_clone2.lock().unwrap()) {
+                        if let Err(err) = send_image_to_server(server_address, image_path, &socket) {
                             eprintln!("Error sending image to the server: {}", err);
                         }
                     }
                     println!("Image sent to the server.");
                 }
                 "list" => {
-                    let socket = socket_clone2.lock().unwrap();
                     for server_address in server_addresses {
                         socket.send_to(b"list", server_address);
                     }
@@ -319,6 +308,24 @@ fn main() -> io::Result<()> {
                         todo!()
                     };
                     println!("{}", str::from_utf8(&buf[..amt]).unwrap());
+                    // go over the list of ips and grap the ip number then open it in the browser
+                    // with 8080 port by finding the string word that has the character : then
+                    // split it and open in the browser the left part of the string with 8080 port
+                    let mut flag = false;
+                    for line in str::from_utf8(&buf[..amt]).unwrap().lines() {
+                        if !flag {
+                            flag = true;
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        // split part two into ip and port then add the ip to 8080 and open it in the browser
+                        let url = parts[2].split(':').collect::<Vec<&str>>();
+                        let ip = url[0];
+                        let mut url = String::from("http://");
+                        url.push_str(ip);
+                        url.push_str(":8080");
+                        webbrowser::open(&url).unwrap();
+                    }
                     socket.set_read_timeout(None);
                 }
                 "lease" => {
@@ -327,7 +334,6 @@ fn main() -> io::Result<()> {
                 }
                 "request" => {
                     let mut buf = [0u8; 65507];
-                    let socket = socket_clone2.lock().unwrap();
                     socket.send_to(format!("Can I have {}?", parts[1]).as_bytes(), format!("{}:1939", parts[2]));
                     println!("Request sent.");
                 }
@@ -343,6 +349,5 @@ fn main() -> io::Result<()> {
 
     handle_website.join().unwrap();
     handle_input.join().unwrap();
-    handle_requests_recieved.join().unwrap();
     Ok(())
 }

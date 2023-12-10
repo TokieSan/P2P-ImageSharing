@@ -24,10 +24,18 @@ fn handle_list_command(processed: &HashMap<(String, usize), bool>) -> String {
     let mut client_list = String::new();
     let mut i = 0;
     for (client, _) in processed.keys() {
-        client_list.push_str(&format!("Client {}: {}\n", i, client));
+        client_list.push_str(&format!("Client Active: {}\n", client));
         i += 1;
     }
-    client_list
+    // clear duplicates from the string list client_list
+    let mut client_list: Vec<&str> = client_list.split("\n").collect();
+    client_list.sort();
+    client_list.dedup();
+    // convert back to string
+    let mut client_list_string = String::new();
+    client_list_string.push_str("Client List:");
+    client_list_string.push_str(&client_list.join("\n"));
+    client_list_string
 }
 
 // Function to determine if the message is serialized or direct.
@@ -258,6 +266,15 @@ fn is_leader_alive(
     }
 }
 
+fn is_valid_message(buf: &[u8]) -> bool {
+    let command = String::from_utf8_lossy(&buf[..]);
+    let command = command.trim();
+    let command = command.to_lowercase();
+    if command == "ping" || command == "list" {
+        return true;
+    }
+    false
+}
 fn handle_client_messages(
     socket: &UdpSocket,
     server_addresses: &[&str],
@@ -273,12 +290,24 @@ fn handle_client_messages(
             Ok((amt, src)) => {
                 println!("Received {} bytes from: {} at clients thread", amt, src);
 
-                if !is_serialized_message(&buf) {
+                if !is_serialized_message(&buf) || !is_valid_message(&buf) {
 
                     let command = String::from_utf8_lossy(&buf[..amt]);
                     if command != "" && command == "list" {
+                        // if the client wasn't in the list, add it
+                        if !processed.contains_key(&(src.to_string().to_owned(), amt)) {
+                            processed.insert((src.to_string().to_owned(), amt), true);
+                        }
                         let client_list = handle_list_command(&processed);
                         let _ = socket.send_to(&client_list.as_bytes(), src);
+                        continue;
+                    }
+
+                    if command != "" && command == "ping" {
+                        println!("Ping received from: {}", src);
+                        if !processed.contains_key(&(src.to_string().to_owned(), amt)) {
+                            processed.insert((src.to_string().to_owned(), amt), true);
+                        }
                         continue;
                     }
                     
@@ -304,7 +333,8 @@ fn handle_client_messages(
                     }
                 } else {
                     // Received a message from a server checking if leader, me,  is alive.
-                    let message: ServerMessage = bincode::deserialize(&buf[..amt]).unwrap();
+                    // try to unwrap and if error continue
+                    let message = deserialize_message(&buf).unwrap();
                     println!(
                         "Message: Sent by: {} to: {} type: {} leader: {} assuring I am alive. I am.",
                         message.sender, message.client, message.msg_type, message.cur_leader
@@ -319,8 +349,10 @@ fn handle_client_messages(
                     };
 
                     let serialized_response = bincode::serialize(&response).unwrap();
-                    socket.send_to(&serialized_response, server_addresses[message.sender as usize])
-                        .expect("Failed to send response");
+                    if message.sender < server_addresses.len() as i32 {
+                        socket.send_to(&serialized_response, server_addresses[message.sender as usize])
+                            .expect("Failed to send response");
+                    }
                 }
             }
             Err(e) => {
